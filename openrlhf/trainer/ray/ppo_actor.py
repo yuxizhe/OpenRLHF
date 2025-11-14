@@ -429,6 +429,10 @@ class PolicyModelActor(BaseModelActor):
                 attn_implementation=strategy.args.attn_implementation,
                 bf16=strategy.args.bf16,
                 load_in_4bit=strategy.args.load_in_4bit,
+                lora_rank=strategy.args.lora_rank,
+                lora_alpha=strategy.args.lora_alpha,
+                target_modules=strategy.args.target_modules,
+                lora_dropout=strategy.args.lora_dropout,
                 ds_config=strategy.get_ds_eval_config(offload=True),
                 packing_samples=strategy.args.packing_samples,
             )
