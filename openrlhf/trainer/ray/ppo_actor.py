@@ -309,9 +309,36 @@ class ActorPPOTrainer(ABC):
 
         torch.cuda.empty_cache()
         model = self.actor.model.module
-        count, num_params = 0, len(list(model.named_parameters()))
+        
+        # Check if model is PeftModel (LoRA) and handle parameter name mapping
+        from peft import PeftModel
+        is_peft_model = isinstance(model, PeftModel)
+        
+        # For LoRA models, we need to sync base model parameters with corrected names
+        # vLLM expects parameter names without 'base_model.model.' prefix
+        if is_peft_model:
+            base_model = model.get_base_model()
+            params_to_sync = []
+            
+            # Iterate through base model parameters and map names for vLLM
+            for name, param in base_model.named_parameters():
+                # Remove 'model.' prefix if present (e.g., 'model.embed_tokens.weight' -> 'embed_tokens.weight')
+                vllm_name = name
+                if name.startswith("model."):
+                    vllm_name = name[len("model."):]
+                
+                # Skip LoRA adapter parameters if they exist in base_model
+                if "lora_" in vllm_name:
+                    continue
+                
+                params_to_sync.append((vllm_name, param))
+        else:
+            # For non-LoRA models, sync all parameters as-is
+            params_to_sync = [(name, param) for name, param in model.named_parameters()]
+        
+        count, num_params = 0, len(params_to_sync)
 
-        def _broadcast_param(param, count, num_params):
+        def _broadcast_param(name, param, count, num_params):
             use_ray = getattr(self.strategy.args, "vllm_sync_with_ray", False)
             # Fire all vllm engines for broadcast
             if torch.distributed.get_rank() == 0:
@@ -329,7 +356,7 @@ class ActorPPOTrainer(ABC):
                     self._model_update_group.broadcast(param.data, src=0, stream=torch.cuda.current_stream())
                 ray.get(refs)
 
-        def _handle_cuda_ipc(param, count, num_params):
+        def _handle_cuda_ipc(name, param, count, num_params):
             from torch.multiprocessing.reductions import reduce_tensor
 
             weight = param.data.clone()
@@ -358,7 +385,7 @@ class ActorPPOTrainer(ABC):
                 ray.get(refs)
             torch_dist_barrier_and_cuda_sync()
 
-        for name, param in model.named_parameters():
+        for vllm_name, param in params_to_sync:
             count += 1  # empty_cache at last param
 
             # broadcast
@@ -366,18 +393,18 @@ class ActorPPOTrainer(ABC):
                 # For ZeRO-3, allgather sharded parameter and broadcast to all vllm engines by rank 0
                 if self.strategy.args.ds_tensor_parallel_size > 1:
                     with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
-                        _broadcast_param(param, count, num_params)
+                        _broadcast_param(vllm_name, param, count, num_params)
                 else:
                     with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                        _broadcast_param(param, count, num_params)
+                        _broadcast_param(vllm_name, param, count, num_params)
             # CUDA IPC
             else:
                 if self.strategy.args.ds_tensor_parallel_size > 1:
                     with deepspeed.module_inject.layers.GatherReplacedLayerParams([param], model, enabled=True):
-                        _handle_cuda_ipc(param, count, num_params)
+                        _handle_cuda_ipc(vllm_name, param, count, num_params)
                 else:
                     with deepspeed.zero.GatheredParameters([param], enabled=self.strategy.args.zero_stage == 3):
-                        _handle_cuda_ipc(param, count, num_params)
+                        _handle_cuda_ipc(vllm_name, param, count, num_params)
 
         if cache_reset_refs:
             ray.get(cache_reset_refs)
